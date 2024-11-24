@@ -1,4 +1,18 @@
-# utils.py
+# metagnn.utils.py
+
+import os
+
+METAGNN_GLOBALS = dict()
+METAGNN_GLOBALS["save_folder"] = "./_metagnn/"
+
+def get_logger(name):
+    import logging
+    logger = logging.getLogger(name)
+    logging.basicConfig(
+        format="%(asctime)s | %(levelname)s : %(message)s",
+        level=logging.INFO,
+    )
+    return logger
 
 def is_notebook():
     """
