@@ -1,6 +1,6 @@
 # metagnn.tools.data.loaders.py
 
-import re, os
+import re, os, json, gzip
 import pandas as pd
 
 import torch
@@ -13,19 +13,24 @@ from typing import List
 from metagnn.tools.data.debruijn import DeBruijnGraph
 from metagnn.tools.data.lzani import LzAniRunner
 from metagnn.tools.common import MetaGNNConfig
-from metagnn.utils import is_notebook, METAGNN_GLOBALS
+from metagnn.utils import is_notebook, METAGNN_GLOBALS, get_logger
 
 if is_notebook():
     from tqdm.notebook import tqdm
 else:
     from tqdm import tqdm
 
+logger = get_logger(__name__)
+
 def process_sequence(args):
     debruijn, sequence = args
     return debruijn.generate_pyg_data(sequence, debruijn.k)
 
 def extract_accession_id(header):
-    match = re.search(r"\b[A-Z]{2}\d{6,7}\.\d\b", header)
+    match = re.search(
+        r"([A-Z]+_?[A-Z]*\d+\.\d+)",
+        header,
+    )
     return match.group(0) if match else "NA"
 
 class MetagenomeDataset(Dataset):
@@ -38,6 +43,7 @@ class MetagenomeDataset(Dataset):
         self.k = config.k
         self.max_length = config.max_length
         self.num_workers = config.num_workers
+        self.train = train
 
         self.headers, self.sequences = self.load_fasta(fasta_file)
         
@@ -66,36 +72,43 @@ class MetagenomeDataset(Dataset):
         # else:
         #     seq_window = sequence
     
-        # one_hot_window = self.one_hot_encode(seq_window)
+        one_hot_window = self.one_hot_encode(sequence)
+        fft_seq = torch.fft.fft(one_hot_window, dim=0)
     
-        # fft_seq = torch.fft.fft(one_hot_window, dim=0)
-    
-        # if len(sequence) < self.max_length:
-        #     pad_size = self.max_length - len(sequence)
-        #     fft_seq = torch.cat(
-        #         [fft_seq, torch.zeros((pad_size, 4), dtype=torch.complex64)],
-        #         dim=0,
-        #     )
+        if len(sequence) < self.max_length:
+            pad_size = self.max_length - len(sequence)
+            fft_seq = torch.cat(
+                [fft_seq, torch.zeros((pad_size, 4), dtype=torch.complex64)],
+                dim=0,
+            )
+        else:
+            fft_seq = fft_seq[:self.max_length]
 
         return {
-            # "fft": fft_seq,
+            "fft": fft_seq,
             "graphs": self.graphs[idx],
             "headers":  self.headers[idx],
         }
 
     def metagenome_collate_fn(self, batch):
-        # fft_mtx = self.fft_similarity(
-        #     torch.stack([item["fft"] for item in batch], dim=0)
-        # )
+        fft_mtx = self.fft_similarity(
+            torch.stack([item["fft"] for item in batch], dim=0)
+        )
         graphs = [item["graphs"] for item in batch]
         batched_graphs = Batch.from_data_list(graphs)
         headers = [[item["headers"] for item in batch]]
-        ani_mtx, wgt_mtx = self.ani_similarity([item["headers"] for item in batch])
+        if self.train is True:
+            ani_mtx, wgt_mtx = self.ani_similarity([item["headers"] for item in batch])
+            return {
+                "graphs": batched_graphs,
+                "fft_mtx": fft_mtx,
+                "ani_mtx": ani_mtx,
+                "wgt_mtx": wgt_mtx,
+                "headers": headers,
+            }
         return {
             "graphs": batched_graphs,
-            # "fft_mtx": fft_mtx,
-            "ani_mtx": ani_mtx,
-            "wgt_mtx": wgt_mtx,
+            "fft_mtx": fft_mtx,
             "headers": headers,
         }
 
@@ -107,33 +120,29 @@ class MetagenomeDataset(Dataset):
         for i, ref_id in enumerate(batch_ids):
             for j, query_id in enumerate(batch_ids):
                 if ref_id != query_id:
-                    try:
-                        ani_score, len_ratio = self.ani.loc[(query_id, ref_id), ["ani", "len_ratio"]]
-                        ani_matrix[i, j] = ani_score
-                        weights_matrix[i, j] = len_ratio
-                    except KeyError:
-                        pass
+                    ani_data = self.ani.get((query_id + "|" + ref_id), {})
+                    ani_matrix[i, j] = ani_data.get("ani", 0.0)
+                    weights_matrix[i, j] = ani_data.get("len_ratio", 0.0)
     
         return ani_matrix, weights_matrix
     
     def fft_similarity(self, fft_batch):
-        num_non_zeros = (fft_batch.abs().sum(dim=-1) > 0).sum(dim=1) # Effective lengths
-        length_differences = torch.abs(num_non_zeros.unsqueeze(1) - num_non_zeros.unsqueeze(0))  
+        num_non_zeros = (fft_batch.abs().sum(dim=-1) > 0).sum(dim=1)  # Effective lengths
+        length_differences = torch.abs(num_non_zeros.unsqueeze(1) - num_non_zeros.unsqueeze(0))
         length_sums = num_non_zeros.unsqueeze(1) + num_non_zeros.unsqueeze(0)
     
         self_product = fft_batch * torch.conj(fft_batch)
         self_correlation = torch.fft.ifft(self_product, dim=1)
-        self_correlation = self_correlation.real + self_correlation.imag
+        self_correlation = self_correlation.real
         self_similarity = torch.max(self_correlation.sum(dim=-1), dim=1).values
     
         sequences_1 = fft_batch.unsqueeze(1)
         sequences_2 = fft_batch.unsqueeze(0)
         product = sequences_1 * torch.conj(sequences_2)
         cross_correlation = torch.fft.ifft(product, dim=2)
-        cross_correlation = cross_correlation.real.sum(dim=-1) + cross_correlation.imag.sum(dim=-1)
+        cross_correlation = torch.abs(cross_correlation).sum(dim=-1)
         similarity_matrix = torch.max(cross_correlation, dim=2).values
     
-        # Normalize by the relative length difference
         length_ratio = (1 - (length_differences / (length_sums + 1e-8)))
         similarity_matrix *= length_ratio
     
@@ -191,25 +200,53 @@ class MetagenomeDataset(Dataset):
 
     def build_or_get_ani(self, fasta_file: str):
         file_name = re.search(r"([^/\\]+)\.fasta$", fasta_file).group(1)
-        output_path = os.path.join(
+        json_path = os.path.join(
             METAGNN_GLOBALS["save_folder"],
-            f"{file_name}_ani.tsv"
+            f"{file_name}_ani.json.gz"
         )
-
-        if not os.path.exists(output_path):
-            os.makedirs(METAGNN_GLOBALS["save_folder"], exist_ok=True)
-            runner = LzAniRunner()
-            runner.run(
-                fasta_paths=fasta_file,
-                output_path=output_path,
-                num_threads=self.num_workers,
-                verbose=False,
+        if not os.path.exists(json_path):
+            output_path = os.path.join(
+                METAGNN_GLOBALS["save_folder"],
+                f"{file_name}_ani.tsv"
             )
-        ani_df = pd.read_csv(output_path, sep="\t")
-        for c in ["query", "reference"]:
-            ani_df[c] = ani_df[c].astype(str).str.extract(
-                r"(\b[A-Z]{2}\d{6,7}\.\d\b)"
+            if not os.path.exists(output_path):
+                os.makedirs(METAGNN_GLOBALS["save_folder"], exist_ok=True)
+                runner = LzAniRunner()
+                runner.run(
+                    fasta_paths=fasta_file,
+                    output_path=output_path,
+                    num_threads=self.num_workers,
+                    verbose=False,
+                )
+            else:
+                logger.info(f"Loading stored pairs from {output_path}...")
+    
+            pattern = re.compile(r"([A-Z]+_?[A-Z]*\d+\.\d+)")
+            ani_dict = {}
+        
+            chunk_iter = pd.read_csv(
+                tsv_path,
+                sep="\t",
+                usecols=["query", "reference", "ani", "len_ratio"],
+                dtype={"query": str, "reference": str, "ani": float, "len_ratio": float},
+                chunksize=1_000_000
             )
-        ani_df.dropna(subset=["query", "reference"], inplace=True)
-        ani_df.set_index(["query", "reference"], inplace=True)
-        return ani_df[["ani", "len_ratio"]]
+        
+            for chunk in chunk_iter:
+                chunk["query"] = chunk["query"].str.extract(pattern)
+                chunk["reference"] = chunk["reference"].str.extract(pattern)
+                chunk.dropna(subset=["query", "reference"], inplace=True)
+                ani_dict.update({
+                    f"{row['query']}|{row['reference']}": {"ani": row["ani"], "len_ratio": row["len_ratio"]}
+                    for _, row in chunk.iterrows()
+                })
+        
+            with gzip.open(json_path, "wt", encoding="utf-8") as f:
+                json.dump(ani_dict, f)
+        else:
+            logger.info(f"Loading precomputed ANI JSON from {json_path}...")
+            with gzip.open(json_path, "rt", encoding="utf-8") as f:
+                ani_dict = json.load(f)
+        
+        # ani_dict = {tuple(k.split("|")): v for k, v in ani_dict.items()}
+        return ani_dict

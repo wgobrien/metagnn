@@ -7,7 +7,7 @@ from typing import List
 
 import pyro
 import pyro.optim as optim
-from pyro.infer import SVI, Trace_ELBO
+from pyro.infer import SVI, TraceEnum_ELBO
 
 import seaborn as sns
 import matplotlib.pyplot as plt
@@ -87,7 +87,7 @@ def train_metagnn(
             kmer_map=dataset.debruijn.kmer_map,
             config=config,
         )
-
+    logger.info(f"{get_num_model_params(vae)} paramter model")
     vae.to(config.device)
     training_loop(vae, train_dataloader, val_dataloader)
 
@@ -147,7 +147,7 @@ def training_loop(
                 save_model(vae, overwrite=True, verbose=False)
                 logger.info(f"Model saved at epoch {epoch} with val loss: {avg_val_loss:.4f}")
         
-        if epoch % save_interval == 0 and epoch > num_epochs // 5:
+        if epoch % save_interval == 0:
             save_model(vae, overwrite=True, verbose=False)
             logger.info(f"Checkpoint model saved at epoch {epoch}")  
     
@@ -225,13 +225,13 @@ def contrastive_loss(z_mu, similarity_matrix, weights_matrix=None, margin=1.0):
     pairwise_distances = torch.cdist(z_mu, z_mu, p=2) ** 2
     positive_loss = similarity_matrix * pairwise_distances
     negative_loss = (1 - similarity_matrix) * torch.clamp(margin - pairwise_distances.sqrt(), min=0) ** 2
-    similarity_loss = (positive_loss + negative_loss)
+    contr_loss = (positive_loss + negative_loss)
     
     if weights_matrix is not None:
-        similarity_loss *= weights_matrix
-        return similarity_loss.sum() / (weights_matrix.sum() + 1e-8)
+        contr_loss *= weights_matrix
+        return contr_loss.sum() / (weights_matrix.sum() + 1e-8)
     
-    return similarity_loss.mean()
+    return contr_loss.mean()
 
 def loss_fn_factory(config, progress_bar=None):
     steps = torch.arange(config.num_epochs)
@@ -240,22 +240,24 @@ def loss_fn_factory(config, progress_bar=None):
     kl_annealing = torch.sigmoid((steps - shift) / scale)
     
     def loss(model, guide, batch, epoch):
-        # batch_fft = batch["fft_mtx"]
+        batch_fft = batch["fft_mtx"]
         batch_graphs = batch["graphs"]
         batch_size = config.batch_size
 
         anneal = kl_annealing[epoch]
-        elbo_loss = Trace_ELBO().differentiable_loss(model, guide, batch) * anneal
+        elbo_loss = TraceEnum_ELBO(max_plate_nesting=1).differentiable_loss(model, guide, batch) * anneal
+        
         reco_loss = reconstruction_loss(
             observed_batch=batch_graphs,
             decoded_batch=model(batch)[1],
-        ) * 4 * (4**(config.k-1)) # scale by num edges
+        ) * (4 * 4**(config.k-1))
         
         cont_loss = contrastive_loss(
             guide(batch)[0],
             batch["ani_mtx"], 
             batch["wgt_mtx"],
-        ) * (4 * 4**(config.k))
+            margin=config.margin,
+        ) * 4 * (4**(config.k-1))
 
         batch_loss = cont_loss + reco_loss + elbo_loss
         

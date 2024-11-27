@@ -9,26 +9,27 @@ class MetaGNNConfig:
     ## DATA PARAMETERS
     node_feature_dim: int = 1 # batch.x.size(1)
     edge_attr_dim: int = 1 # batch.edge_attr.size(1)
-    max_length: int = 5000
+    max_length: int = 8000
     k: int = 7
 
     ## TRAINING PARAMETERS
-    num_epochs: int = 100
-    batch_size: int = 8
-    learning_rate: float = .01
+    num_epochs: int = 200
+    batch_size: int = 16
+    learning_rate: float = .05
     val_split: float = 0.
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     verbose: bool = True
-    save_interval: int = 10
+    save_interval: int = 2
     improvement_threshold: float = .05
     num_workers: int = 8
 
     ## MODEL HYPERPARAMETERS
-    hidden_dim: int = 64
-    latent_dim: int = 2
-    num_layers: int = 2
-    num_components: int = 5
-    beta_strength: float = 1.
+    hidden_dim: int = 256
+    latent_dim: int = 16
+    num_layers: int = 3
+    num_components: int = 10
+    beta_strength: float = .5
+    margin: float = 1.
     
     def to_dict(self):
         res = dataclasses.asdict(self)
