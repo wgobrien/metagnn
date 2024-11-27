@@ -250,14 +250,14 @@ def loss_fn_factory(config, progress_bar=None):
         reco_loss = reconstruction_loss(
             observed_batch=batch_graphs,
             decoded_batch=model(batch)[1],
-        ) * (4 * 4**(config.k-1))
+        ) * 4**(config.k-1)
         
         cont_loss = contrastive_loss(
             guide(batch)[0],
             batch["ani_mtx"], 
             batch["wgt_mtx"],
             margin=config.margin,
-        ) * 4 * (4**(config.k-1))
+        ) * 4**(config.k-1)
 
         batch_loss = cont_loss + reco_loss + elbo_loss
         

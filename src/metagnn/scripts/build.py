@@ -23,6 +23,7 @@ def main(args):
         num_layers=args.num_layers,
         num_components=args.num_components,
         beta_strength=args.beta_strength,
+        margin=args.margin,
     )
 
     input_fasta = os.path.abspath(args.input_fasta)

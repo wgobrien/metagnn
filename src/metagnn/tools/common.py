@@ -19,7 +19,7 @@ class MetaGNNConfig:
     val_split: float = 0.
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     verbose: bool = True
-    save_interval: int = 2
+    save_interval: int = 5
     improvement_threshold: float = .05
     num_workers: int = 8
 
