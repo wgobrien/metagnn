@@ -11,7 +11,6 @@ class GraphEncoder(pyro.nn.PyroModule):
          hidden_dim: int, 
          latent_dim: int, 
          num_layers: int, 
-         edge_attr_dim: int,
     ):
         super().__init__()
         
@@ -29,11 +28,6 @@ class GraphEncoder(pyro.nn.PyroModule):
             self.skip_connections.append(
                 torch.nn.Linear(in_dim, hidden_dim)
             )
-
-        self.norms = torch.nn.ModuleList([
-            torch.nn.LayerNorm(hidden_dim)
-            for _ in range(num_layers)
-        ])
         
         self.pool = SAGPooling(hidden_dim)
         
@@ -44,7 +38,6 @@ class GraphEncoder(pyro.nn.PyroModule):
         for i, conv in enumerate(self.convs):
             x_skip = self.skip_connections[i](x)
             x = conv(x, edge_index, edge_weight) + x_skip
-            x = self.norms[i](x)
             x = torch.relu(x)
 
         x, edge_index, edge_weight, batch, perm, score = self.pool(

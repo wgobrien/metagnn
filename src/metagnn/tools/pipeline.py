@@ -41,7 +41,6 @@ def train_metagnn(
         if config is not None:
             # if updating config, update mutable params only
             vae.config.num_epochs = config.num_epochs
-            vae.config.batch_size = config.batch_size
             vae.config.learning_rate = config.learning_rate
             vae.config.val_split = config.val_split
             vae.config.device = config.device
@@ -49,13 +48,13 @@ def train_metagnn(
             vae.config.save_interval = config.save_interval
             vae.config.improvement_threshold = config.improvement_threshold
             vae.config.num_workers = config.num_workers
-        
+            vae.config.contrastive_only = config.contrastive_only
         config = vae.config
 
     if config is None:
         config = MetaGNNConfig()
   
-    dataset = MetagenomeDataset(fasta, config, train=True)
+    dataset = MetagenomeDataset(fasta, config)
 
     val_dataloader = None
     if config.val_split > 0:
@@ -89,24 +88,28 @@ def train_metagnn(
         )
     logger.info(f"{get_num_model_params(vae)} paramter model")
     vae.to(config.device)
-    training_loop(vae, train_dataloader, val_dataloader)
+    training_loop(vae, train_dataloader, val_dataloader, contrastive_only=config.contrastive_only)
 
 def training_loop(
     vae,
     train_dataloader,
     val_dataloader=None,
+    contrastive_only: bool=False,
 ):
     activate_plot_settings()
     config = vae.config
     device = config.device
 
-    optimizer = optim.ClippedAdam({"lr": config.learning_rate})
+    optimizer = optim.ClippedAdam({
+        "lr": config.learning_rate,
+        "weight_decay": 1e-4,
+    })
     num_epochs = config.num_epochs
     total_iterations = num_epochs * len(train_dataloader)
     progress_bar = tqdm(total=total_iterations, desc="Training Progress")
     
     epoch_losses, batch_losses, val_losses = [], [], []
-    loss_fn = loss_fn_factory(config, progress_bar)
+    loss_fn = loss_fn_factory(config, progress_bar, contrastive_only=contrastive_only)
     svi = SVI(vae.model, vae.guide, optimizer, loss=loss_fn)
 
     best_loss = torch.inf
@@ -119,7 +122,7 @@ def training_loop(
         epoch_loss = 0.0
 
         for batch_idx, batch in enumerate(train_dataloader):
-            batch_loss = svi.step(batch, epoch)
+            batch_loss = svi.step(batch["graphs"], batch["graph_sim"], epoch)
             epoch_loss += batch_loss
             batch_losses.append(batch_loss)
 
@@ -135,7 +138,7 @@ def training_loop(
             val_loss = 0.0
             with torch.no_grad():
                 for val_batch in val_dataloader:
-                    val_loss += svi.evaluate_loss(val_batch)
+                    val_loss += svi.evaluate_loss(val_batch["graphs"], val_batch["graph_sim"], epoch)
             avg_val_loss = val_loss / len(val_dataloader)
             val_losses.append(avg_val_loss)
             progress_bar.set_description(
@@ -159,40 +162,12 @@ def training_loop(
             plot_loss(validation_loss, label="validation", log_loss=True)
     progress_bar.close()
 
-def triplet_loss(anchor, positive, negative, margin=1.0):
-    pos_dist = torch.norm(anchor - positive, p=2, dim=1)
-    neg_dist = torch.norm(anchor - negative, p=2, dim=1)
-
-    loss = torch.clamp(pos_dist - neg_dist + margin, min=0)
-    return loss.mean()
-
 def reconstruction_loss(decoded_batch, observed_batch):
     device = observed_batch.edge_index.device
     batch_size = len(observed_batch.ptr) - 1
     total_loss = 0.0
     
     for i in range(batch_size):
-        # obs_start = observed_batch.ptr[i].item()
-        # mask_obs = (
-        #     (observed_batch.edge_index[0] >= obs_start)
-        #     &
-        #     (observed_batch.edge_index[0] < observed_batch.ptr[i + 1].item())
-        # )
-        # observed_edges = observed_batch.edge_index[:, mask_obs]
-        # observed_edges -= obs_start
-        # num_pos_edges = observed_edges.size(1)
-
-        # decoded_start = decoded_batch.ptr[i].item()
-        # mask_decoded = (
-        #     (decoded_batch.edge_index[0] >= decoded_start)
-        #     &
-        #     (decoded_batch.edge_index[0] < decoded_batch.ptr[i + 1].item())
-        # )
-        # decoded_edges = decoded_batch.edge_index[:, mask_decoded]
-        # decoded_edges -= decoded_start
-        # edge_proba = decoded_batch.edge_proba[mask_decoded]
-        # num_negative_samples = num_pos_edges
-        
         obs_i = observed_batch.get_example(i)
         dec_i = decoded_batch.get_example(i)
         edge_proba = dec_i.edge_proba
@@ -203,7 +178,7 @@ def reconstruction_loss(decoded_batch, observed_batch):
         pos_probas = edge_proba[pos_edge_mask]
         neg_probas = edge_proba[~pos_edge_mask]
         
-        perm = torch.randperm(neg_probas.size(0))#[:num_pos_samples]
+        perm = torch.randperm(neg_probas.size(0))[:num_pos_samples]
         neg_probas = neg_probas[perm]
 
         pos_target = torch.ones_like(pos_probas)
@@ -215,60 +190,84 @@ def reconstruction_loss(decoded_batch, observed_batch):
         neg_loss = torch.nn.functional.binary_cross_entropy(
             neg_probas, neg_target, reduction='mean'
         )
+        # print(pos_loss, neg_loss)
     
         total_loss += (pos_loss + neg_loss)
     return total_loss / batch_size
 
-def contrastive_loss(z_mu, similarity_matrix, weights_matrix=None, margin=1.0):
+def contrastive_loss(z_mu, similarity_matrix, margin=1.0, l2=1e-1, spread_lambda=.1):
     batch_size = z_mu.size(0)
+    distances = torch.cdist(z_mu, z_mu, p=2)
     
-    pairwise_distances = torch.cdist(z_mu, z_mu, p=2) ** 2
-    positive_loss = similarity_matrix * pairwise_distances
-    negative_loss = (1 - similarity_matrix) * torch.clamp(margin - pairwise_distances.sqrt(), min=0) ** 2
-    contr_loss = (positive_loss + negative_loss)
-    
-    if weights_matrix is not None:
-        contr_loss *= weights_matrix
-        return contr_loss.sum() / (weights_matrix.sum() + 1e-8)
-    
-    return contr_loss.mean()
+    positive_loss = similarity_matrix * distances ** 2
+    negative_loss = (1 - similarity_matrix) * torch.clamp(margin - distances.sqrt(), min=0) ** 2
+    contr_loss = (positive_loss + negative_loss).mean()
 
-def loss_fn_factory(config, progress_bar=None):
+    contr_loss += l2 * (z_mu.norm(p=2) ** 2)
+
+    embedding_mean = z_mu.mean(dim=0)
+    embedding_variance = ((z_mu - embedding_mean) ** 2).mean()
+    spread_regularization = -spread_lambda * embedding_variance
+    contr_loss += spread_regularization
+
+    return contr_loss
+
+def loss_fn_factory(
+    config: MetaGNNConfig,
+    progress_bar: bool=None,
+    contrastive_only: bool=False,
+    annealing_enabled: bool=False,
+):
     steps = torch.arange(config.num_epochs)
     scale = steps / 10
     shift = config.num_epochs / 2.5
-    kl_annealing = torch.sigmoid((steps - shift) / scale)
+    kl_annealing = torch.sigmoid((steps - shift) / scale) if annealing_enabled else torch.ones(config.num_epochs)
     
-    def loss(model, guide, batch, epoch):
-        batch_fft = batch["fft_mtx"]
-        batch_graphs = batch["graphs"]
+    def loss(model, guide, batch_graphs, batch_sim, epoch):
         batch_size = config.batch_size
 
         anneal = kl_annealing[epoch]
-        elbo_loss = TraceEnum_ELBO(max_plate_nesting=1).differentiable_loss(model, guide, batch) * anneal
-        
-        reco_loss = reconstruction_loss(
-            observed_batch=batch_graphs,
-            decoded_batch=model(batch)[1],
-        ) * 4**(config.k-1)
-        
-        cont_loss = contrastive_loss(
-            guide(batch)[0],
-            batch["ani_mtx"], 
-            batch["wgt_mtx"],
-            margin=config.margin,
-        ) * 4**(config.k-1)
 
-        batch_loss = cont_loss + reco_loss + elbo_loss
-        
-        if progress_bar is not None:
-            progress_bar.set_postfix(
-                batch_loss=batch_loss.item(),
-                elbo_loss=elbo_loss.item(),
-                contrastive_loss=cont_loss.item(),
-                reconstruction_loss=reco_loss.item(),
-                anneal=anneal.item(),
-            )
+        if contrastive_only:
+            cont_loss = contrastive_loss(
+                guide(x=batch_graphs)[0],
+                batch_sim,
+                margin=config.margin,
+            ) * 4**(config.k-1)
+
+            batch_loss = cont_loss
+
+            if progress_bar is not None:
+                progress_bar.set_postfix(
+                    batch_loss=batch_loss.item(),
+                    contrastive_loss=cont_loss.item(),
+                )
+
+        else:
+            elbo_loss = TraceEnum_ELBO(max_plate_nesting=1).differentiable_loss(model, guide, batch_graphs, batch_sim) * anneal
+
+            # reco_loss = reconstruction_loss(
+            #     observed_batch=batch_graphs,
+            #     decoded_batch=model(batch)[1],
+            # ) * 4**(config.k-1)
+
+            # cont_loss = contrastive_loss(
+            #     guide(x=batch_graphs)[0],
+            #     batch_sim,
+            #     margin=config.margin,
+            # ) * 4**(config.k-1)
+
+            batch_loss = elbo_loss # + reco_loss + cont_loss
+
+            if progress_bar is not None:
+                progress_bar.set_postfix(
+                    batch_loss=batch_loss.item(),
+                    elbo_loss=elbo_loss.item(),
+                    # contrastive_loss=cont_loss.item(),
+                    # reconstruction_loss=reco_loss.item(),
+                    anneal=anneal.item(),
+                )
         
         return batch_loss
+
     return loss

@@ -8,7 +8,6 @@ from metagnn.utils import is_notebook
 
 def activate_plot_settings():
     if is_notebook():
-        # Set Matplotlib font types for vector graphics
         mpl.rcParams["pdf.fonttype"] = 42
         mpl.rcParams["ps.fonttype"] = 42
         mpl.rcParams["figure.figsize"] = [6, 4]

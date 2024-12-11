@@ -5,8 +5,6 @@ from metagnn.tools.common import MetaGNNConfig
 
 def main(args):
     config = MetaGNNConfig(
-        node_feature_dim=args.node_feature_dim,
-        edge_attr_dim=args.edge_attr_dim,
         max_length=args.max_length,
         k=args.k,
         num_epochs=args.num_epochs,
@@ -24,10 +22,11 @@ def main(args):
         num_components=args.num_components,
         beta_strength=args.beta_strength,
         margin=args.margin,
+        contrastive_only=args.contrastive_only,
     )
 
     input_fasta = os.path.abspath(args.input_fasta)
     if not os.path.exists(input_fasta):
         raise FileNotFoundError(f"Input FASTA file not found: {input_fasta}")
-
+        
     train_metagnn(input_fasta, config, run_id=args.run_id)

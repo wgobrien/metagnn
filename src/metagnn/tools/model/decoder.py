@@ -60,9 +60,9 @@ class GraphDecoder(pyro.nn.PyroModule):
         u_embeddings = x_batch[:, u, :]  # [batch_size, num_nodes, hidden_dim]
         v_embeddings = x_batch[:, v, :]  # [batch_size, num_nodes, hidden_dim]
         h = torch.cat([u_embeddings, v_embeddings], dim=-1)  # [batch_size, num_edges, hidden_dim * 2]
-
+        
         for layer, skip, norm in zip(self.edge_layers, self.edge_skips, self.edge_norms):
             h = torch.relu(norm(layer(h) + skip(h)))
 
-        edge_probas = torch.sigmoid(self.output_layer(h)).squeeze(-1)
+        edge_probas = torch.sigmoid(self.output_layer(h).squeeze(-1))
         return self.decoded_batch(edge_indices, edge_probas, batch_size)

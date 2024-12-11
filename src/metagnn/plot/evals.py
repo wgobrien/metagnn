@@ -3,6 +3,8 @@ import seaborn as sns
 import matplotlib.pyplot as plt
 
 import torch
+import pyro
+import pyro.distributions as dist
 from torch.utils.data import Subset, DataLoader
 
 from metagnn.tools.common import get_pair_subset
@@ -14,55 +16,49 @@ if is_notebook():
 else:
     from tqdm import tqdm
 
-def edge_reconstruction(dataset, vae, sample_size):
-    if vae.config.batch_size > sample_size:
-        raise ValueError(
-            f"`sample_size`={sample_size} must be greater "
-            f"than `batch_size`={vae.config.batch_size}."
+def sample_edges(model, batch, num_samples=(10,)):
+    alpha_q = pyro.param("alpha_q")
+    beta_q = pyro.param("beta_q")
+    model.encoder.eval()
+    
+    z_loc, z_scale = model.encoder(
+        batch["graphs"].x,
+        batch["graphs"].edge_index,
+        batch["graphs"].edge_weight,
+        batch["graphs"].batch,
+    )
+    z_samples = dist.Normal(z_loc, z_scale).sample(num_samples).mean(0)
+    decoded_mtx = model.decoder(z_samples)
+    edge_proba_sparsity_posterior = dist.Beta(alpha_q, beta_q).sample(num_samples).mean(0)
+    sns.histplot(decoded_mtx.edge_proba.detach().numpy())
+    true_non_edge_probas, true_edge_probas = [], []
+    for j in range(len(decoded_mtx.ptr) - 1):
+        overlap_mask = get_pair_subset(
+            decoded_mtx.get_example(j).edge_index,
+            batch["graphs"].get_example(j).edge_index,
+        )
+        cur_example = decoded_mtx.get_example(j)
+        cur_example.edge_proba *= (edge_proba_sparsity_posterior / ((1 - edge_proba_sparsity_posterior) + cur_example.edge_proba))
+        
+        true_edge_probas.append(
+            cur_example.edge_proba[overlap_mask].detach().numpy()
+        )
+        true_non_edge_probas.append(
+            cur_example.edge_proba[~overlap_mask].detach().numpy()
         )
 
-    vae.encoder.eval()
-    vae.decoder.eval()
+    return true_non_edge_probas, true_edge_probas
 
-    decoded_outputs, true_edge_probas, true_non_edge_probas = [], [], []
-    
-    sampled_indices = random.sample(range(len(dataset)), sample_size)
-    subset = Subset(dataset, sampled_indices)
-
-    sampled_dataloader = DataLoader(
-        subset,
-        batch_size=vae.config.batch_size,
-        shuffle=False,
-        collate_fn=dataset.metagenome_collate_fn,
-    )
-
-    iterator = tqdm(sampled_dataloader, desc="Reconstruction progress")
-    with torch.no_grad():
-        for batch in iterator:
-            decoded_mtx = vae(batch)[1]
-
-            for j in range(len(decoded_mtx.ptr) - 1):
-                overlap_mask = get_pair_subset(
-                    decoded_mtx.get_example(j).edge_index, batch["graphs"].get_example(j).edge_index
-                )
-                true_edge_probas.append(decoded_mtx.get_example(j).edge_proba[overlap_mask].detach().numpy())
-                true_non_edge_probas.append(decoded_mtx.get_example(j).edge_proba[~overlap_mask].detach().numpy())
-
-            decoded_outputs.append(decoded_mtx)
-
-    return true_edge_probas, true_non_edge_probas
-
-def reconstruction(dataset, vae, sample_size: int=None):
+def reconstruction(vae, batch, num_samples: int=(10,)):
     activate_plot_settings()
 
-    if sample_size is None:
-        sample_size = min(len(dataset), 32)
-        sample_size = max(vae.config.batch_size + 1, sample_size)
-    
-    true_edge_probas, true_non_edge_probas = edge_reconstruction(
-        dataset, vae, sample_size
-    )
-    for i in range(len(true_edge_probas)):
-        sns.kdeplot(true_non_edge_probas[i], color="r")
-        sns.kdeplot(true_edge_probas[i], color="b")
+    true_non_edge_probas, true_edge_probas = sample_edges(vae, batch, num_samples=num_samples)
+    plt.figure(figsize=(10, 6))
+    for i in range(len(true_non_edge_probas)):
+        sns.kdeplot(true_non_edge_probas[i], color="r", alpha=0.5, label="Non-edge probabilities" if i == 0 else "")
+        sns.kdeplot(true_edge_probas[i], color="b", alpha=0.5, label="Edge probabilities" if i == 0 else "")
+    plt.title("Reconstruction Probability Distributions")
+    plt.xlabel("Edge Probability")
+    plt.ylabel("Density")
+    plt.legend()
     plt.show()

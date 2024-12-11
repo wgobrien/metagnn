@@ -5,13 +5,14 @@ import pandas as pd
 
 import torch
 from torch_geometric.data import Batch, Data
+from torch_geometric.utils import degree
 from torch.utils.data import Dataset, random_split, DataLoader
 
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import List
 
 from metagnn.tools.data.debruijn import DeBruijnGraph
-from metagnn.tools.data.lzani import LzAniRunner
+from metagnn.tools.data.mash import MashRunner
 from metagnn.tools.common import MetaGNNConfig
 from metagnn.utils import is_notebook, METAGNN_GLOBALS, get_logger
 
@@ -19,6 +20,8 @@ if is_notebook():
     from tqdm.notebook import tqdm
 else:
     from tqdm import tqdm
+
+import seaborn as sns
 
 logger = get_logger(__name__)
 
@@ -38,18 +41,18 @@ class MetagenomeDataset(Dataset):
         self,
         fasta_file: str,
         config: MetaGNNConfig,
-        train: bool,
     ):
         self.k = config.k
         self.max_length = config.max_length
         self.num_workers = config.num_workers
-        self.train = train
+        self.device = config.device
+        # self.train = train
 
         self.headers, self.sequences = self.load_fasta(fasta_file)
         
         # For training dataloader only
-        if train is True:
-            self.ani = self.build_or_get_ani(fasta_file)
+        # if train is True:
+        #     self.mash = self.build_or_get_mash(fasta_file)
         
         self.debruijn = DeBruijnGraph(k=self.k, num_workers=self.num_workers)
         if config.num_workers > 1:
@@ -85,69 +88,106 @@ class MetagenomeDataset(Dataset):
             fft_seq = fft_seq[:self.max_length]
 
         return {
-            "fft": fft_seq,
-            "graphs": self.graphs[idx],
+            "fft": fft_seq.to(self.device),
+            "graphs": self.graphs[idx].to(self.device),
             "headers":  self.headers[idx],
+            "seq_len": len(self.sequences[idx])
         }
 
     def metagenome_collate_fn(self, batch):
+        seq_lens = torch.tensor([item["seq_len"] for item in batch], dtype=torch.float32)
         fft_mtx = self.fft_similarity(
-            torch.stack([item["fft"] for item in batch], dim=0)
+            torch.stack([item["fft"] for item in batch], dim=0),
+            seq_lens,
         )
         graphs = [item["graphs"] for item in batch]
         batched_graphs = Batch.from_data_list(graphs)
         headers = [[item["headers"] for item in batch]]
-        if self.train is True:
-            ani_mtx, wgt_mtx = self.ani_similarity([item["headers"] for item in batch])
-            return {
-                "graphs": batched_graphs,
-                "fft_mtx": fft_mtx,
-                "ani_mtx": ani_mtx,
-                "wgt_mtx": wgt_mtx,
-                "headers": headers,
-            }
+
+        graph_sim = self.graph_similarity(batched_graphs)
         return {
             "graphs": batched_graphs,
             "fft_mtx": fft_mtx,
+            "graph_sim": graph_sim,
             "headers": headers,
         }
 
-    def ani_similarity(self, batch_ids):
+    def graph_similarity(self, batch):
+        num_graphs = batch.batch.max().item() + 1
+        degrees_per_graph = torch.zeros((num_graphs, self.debruijn.num_nodes), device=batch.edge_index.device)
+    
+        for i in range(num_graphs):
+            node_mask = batch.batch == i
+            edge_mask = node_mask[batch.edge_index[0]] & node_mask[batch.edge_index[1]]
+            edge_index = batch.edge_index[:, edge_mask]
+            
+            global_to_local = torch.zeros_like(node_mask, dtype=torch.long)
+            global_to_local[node_mask] = torch.arange(node_mask.sum())
+            local_edge_index = global_to_local[edge_index]
+    
+            # Compute node degrees for graph i
+            degrees = degree(local_edge_index[0], num_nodes=node_mask.sum())
+            # normalized_degrees = degrees / (degrees.sum() + 1e-8)  # Normalize by the total degree sum
+            degrees_per_graph[i] = degrees
+            # sns.histplot(normalized_degrees)
+        similarity_matrix = torch.eye(num_graphs)
+        for i in range(num_graphs):
+            for j in range(i + 1, num_graphs):
+                sim = torch.nn.functional.cosine_similarity(
+                    degrees_per_graph[i].unsqueeze(0), degrees_per_graph[j].unsqueeze(0)
+                ).item()
+                similarity_matrix[i, j] = sim
+                similarity_matrix[j, i] = sim
+        return similarity_matrix
+    
+    def mash_similarity(self, batch_ids):
         batch_size = len(batch_ids)
-        ani_matrix = torch.eye(batch_size, dtype=torch.float32)
-        weights_matrix = torch.eye(batch_size, dtype=torch.float32)
+        mash_matrix = torch.zeros((batch_size, batch_size), dtype=torch.float32)
+        weights_matrix = torch.zeros((batch_size, batch_size), dtype=torch.float32)
     
         for i, ref_id in enumerate(batch_ids):
             for j, query_id in enumerate(batch_ids):
                 if ref_id != query_id:
-                    ani_data = self.ani.get((query_id + "|" + ref_id), {})
-                    ani_matrix[i, j] = ani_data.get("ani", 0.0)
-                    weights_matrix[i, j] = ani_data.get("len_ratio", 0.0)
+                    mash_data = self.mash.get((query_id + "|" + ref_id), {})
+                    mash_matrix[i, j] = mash_data.get("distance", 0.0)
+                    weights_matrix[i, j] = mash_data.get("p_val", 0.0)
+
+        # flip the magnitude - similiar should be close to 1, and high p val that match is random shoulded be weighted less (ie p_val=1 means we dont consider the pair) 
+        return 1-mash_matrix, 1-weights_matrix
     
-        return ani_matrix, weights_matrix
-    
-    def fft_similarity(self, fft_batch):
-        num_non_zeros = (fft_batch.abs().sum(dim=-1) > 0).sum(dim=1)  # Effective lengths
-        length_differences = torch.abs(num_non_zeros.unsqueeze(1) - num_non_zeros.unsqueeze(0))
-        length_sums = num_non_zeros.unsqueeze(1) + num_non_zeros.unsqueeze(0)
-    
+    def fft_similarity(self, fft_batch, seq_lens):
+        # self-similarity
         self_product = fft_batch * torch.conj(fft_batch)
-        self_correlation = torch.fft.ifft(self_product, dim=1)
-        self_correlation = self_correlation.real
+        self_correlation = torch.fft.ifft(self_product, dim=1).real
         self_similarity = torch.max(self_correlation.sum(dim=-1), dim=1).values
     
+        # cross-similarity
         sequences_1 = fft_batch.unsqueeze(1)
         sequences_2 = fft_batch.unsqueeze(0)
         product = sequences_1 * torch.conj(sequences_2)
-        cross_correlation = torch.fft.ifft(product, dim=2)
-        cross_correlation = torch.abs(cross_correlation).sum(dim=-1)
+        cross_correlation = torch.fft.ifft(product, dim=2).abs().sum(dim=-1)
         similarity_matrix = torch.max(cross_correlation, dim=2).values
     
-        length_ratio = (1 - (length_differences / (length_sums + 1e-8)))
-        similarity_matrix *= length_ratio
-    
+        # normalize by self-similarity
         normalization_factor = torch.sqrt(self_similarity.unsqueeze(1) * self_similarity.unsqueeze(0))
         similarity_matrix = similarity_matrix / (normalization_factor + 1e-8)
+    
+        # sequence length ratio
+        lengths_i = seq_lens.unsqueeze(1)
+        lengths_j = seq_lens.unsqueeze(0)
+        length_ratio = 2 * torch.min(lengths_i, lengths_j) / (lengths_i + lengths_j + 1e-8)
+    
+        # regress out effect of sequence length ratio
+        X = torch.stack([length_ratio.flatten(), torch.ones_like(length_ratio.flatten())], dim=1)
+        y = similarity_matrix.flatten()
+        beta = torch.linalg.lstsq(X, y).solution
+        predicted_similarity = (beta[0] * length_ratio + beta[1]).view_as(similarity_matrix)
+        similarity_matrix -= predicted_similarity
+    
+        # min-max normalization
+        similarity_matrix_min = similarity_matrix.min()
+        similarity_matrix_max = similarity_matrix.max()
+        similarity_matrix = (similarity_matrix - similarity_matrix_min) / (similarity_matrix_max - similarity_matrix_min + 1e-8)
     
         return similarity_matrix
 
@@ -198,55 +238,60 @@ class MetagenomeDataset(Dataset):
         
         return headers, sequences
 
-    def build_or_get_ani(self, fasta_file: str):
+    def build_or_get_mash(self, fasta_file: str):
         file_name = re.search(r"([^/\\]+)\.fasta$", fasta_file).group(1)
         json_path = os.path.join(
             METAGNN_GLOBALS["save_folder"],
-            f"{file_name}_ani.json.gz"
+            f"{file_name}_mash.json.gz"
         )
         if not os.path.exists(json_path):
             output_path = os.path.join(
                 METAGNN_GLOBALS["save_folder"],
-                f"{file_name}_ani.tsv"
+                f"{file_name}_mash.tsv"
             )
             if not os.path.exists(output_path):
                 os.makedirs(METAGNN_GLOBALS["save_folder"], exist_ok=True)
-                runner = LzAniRunner()
+                runner = MashRunner()
                 runner.run(
-                    fasta_paths=fasta_file,
+                    reference_path=fasta_file,
+                    query_paths=fasta_file,
+                    kmer_size=14,
+                    sketch_size=10_000,
                     output_path=output_path,
                     num_threads=self.num_workers,
-                    verbose=False,
                 )
             else:
                 logger.info(f"Loading stored pairs from {output_path}...")
     
             pattern = re.compile(r"([A-Z]+_?[A-Z]*\d+\.\d+)")
-            ani_dict = {}
-        
+            mash_dict = {}
+    
             chunk_iter = pd.read_csv(
-                tsv_path,
+                output_path,
                 sep="\t",
-                usecols=["query", "reference", "ani", "len_ratio"],
-                dtype={"query": str, "reference": str, "ani": float, "len_ratio": float},
-                chunksize=1_000_000
+                dtype={"reference": str, "query": str, "distance": float, "p_val": float, "counts": str},
+                chunksize=1_000_000,
+                header=None,
+                names=["reference", "query", "distance", "p_val", "counts"]
             )
-        
+    
             for chunk in chunk_iter:
                 chunk["query"] = chunk["query"].str.extract(pattern)
                 chunk["reference"] = chunk["reference"].str.extract(pattern)
                 chunk.dropna(subset=["query", "reference"], inplace=True)
-                ani_dict.update({
-                    f"{row['query']}|{row['reference']}": {"ani": row["ani"], "len_ratio": row["len_ratio"]}
+                mash_dict.update({
+                    f"{row['query']}|{row['reference']}": {
+                        "distance": row["distance"],
+                        "p_val": row["p_val"]
+                    }
                     for _, row in chunk.iterrows()
                 })
-        
+    
             with gzip.open(json_path, "wt", encoding="utf-8") as f:
-                json.dump(ani_dict, f)
+                json.dump(mash_dict, f)
         else:
-            logger.info(f"Loading precomputed ANI JSON from {json_path}...")
+            logger.info(f"Loading precomputed mash JSON from {json_path}...")
             with gzip.open(json_path, "rt", encoding="utf-8") as f:
-                ani_dict = json.load(f)
-        
-        # ani_dict = {tuple(k.split("|")): v for k, v in ani_dict.items()}
-        return ani_dict
+                mash_dict = json.load(f)
+    
+        return mash_dict

@@ -8,13 +8,13 @@ from dataclasses import dataclass, field
 class MetaGNNConfig:
     ## DATA PARAMETERS
     node_feature_dim: int = 1 # batch.x.size(1)
-    edge_attr_dim: int = 1 # batch.edge_attr.size(1)
     max_length: int = 8000
     k: int = 7
 
     ## TRAINING PARAMETERS
-    num_epochs: int = 200
+    num_epochs: int = 100
     batch_size: int = 16
+    contrastive_only: bool = False
     learning_rate: float = .05
     val_split: float = 0.
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
@@ -28,7 +28,6 @@ class MetaGNNConfig:
     latent_dim: int = 16
     num_layers: int = 3
     num_components: int = 10
-    beta_strength: float = .5
     margin: float = 1.
     
     def to_dict(self):
