@@ -5,7 +5,9 @@
 The package can be downloaded with `poetry`. Create a conda environment and install poetry:
 
 `conda create --name metagnn python=3.10`
+
 `conda activate metagnn`
+
 `pip install poetry`
 
 Poetry allows you to install package dependencies and adds the package to your path. Use `poetry install` to complete the build.
@@ -18,7 +20,11 @@ To work with the package from the command line, several commands are available o
 
 Future commands `metagnn --run_id` will perform classification using the specified model. Additional functions are under development.
 
+## Data
 
+To download the refseq dataset, run the following command with curl:
+
+`curl -O ftp://ftp.ncbi.nlm.nih.gov/refseq/release/viral/viral.*.genomic.fna.gz`
 
 ## Configuration
 | Setting                | Default (Type)            | Description                                                                 |
