@@ -8,7 +8,9 @@ The package can be downloaded with `poetry`. Create a conda environment and inst
 
 `conda activate metagnn`
 
-`pip install poetry`
+`pip install poetry biopython faiss`
+
+`conda install bioconda::mash`
 
 Poetry allows you to install package dependencies and adds the package to your path. Use `poetry install` to complete the build.
 
@@ -18,7 +20,7 @@ With the package installed, you can use the package in a variety of ways. Typica
 
 To work with the package from the command line, several commands are available or are works in progress. Training can be performed with `metagnn build`, with options to pick up trainig on a model by passing a `run_id`.
 
-Future commands `metagnn --run_id` will perform classification using the specified model. Additional functions are under development.
+Future commands `metagnn --run_id` will perform classification using FAISS(Facebook AI Similarity Search). Additional functions are under development.
 
 ## Data
 
